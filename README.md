@@ -1,6 +1,6 @@
 # Gut Agentic AI Pipeline
 
-A Claude-powered agent that analyses gut microbiome OTU data from the
+An AI agent that analyses gut microbiome OTU data from the
 American Gut Project, detects dysbiosis, queries PubMed for diet evidence,
 and produces a plain-language microbiome health report.
 
