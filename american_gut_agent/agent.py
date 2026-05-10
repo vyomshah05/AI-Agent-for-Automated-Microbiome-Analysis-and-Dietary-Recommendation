@@ -30,8 +30,8 @@ load_dotenv()
 HERE = Path(__file__).resolve().parent
 PROCESSED_DIR = HERE / "data" / "processed"
 
-DEFAULT_MODEL = "gemini-2.0-flash"
-MAX_TOOL_ITERATIONS = 12  # safety bound on the tool-use loop
+DEFAULT_MODEL = "gemini-2.5-flash"
+MAX_TOOL_ITERATIONS = 12
 
 # ============================================================
 # Cached data (loaded once at import time)
@@ -164,62 +164,57 @@ TOOL_REGISTRY = {
 
 
 # ============================================================
-# Tool schemas (Gemini FunctionDeclaration format)
+# Tool schemas (google.genai types format)
 # ============================================================
 
 def _build_tools():
-    import google.generativeai as genai
+    from google.genai import types
 
-    T = genai.protos.Type
-    Schema = genai.protos.Schema
-    FD = genai.protos.FunctionDeclaration
-    Tool = genai.protos.Tool
-
-    return [Tool(function_declarations=[
-        FD(
+    return [types.Tool(function_declarations=[
+        types.FunctionDeclaration(
             name="calculate_diversity",
             description=(
                 "Compute alpha diversity (Shannon, observed OTUs, Chao1), the "
                 "Firmicutes/Bacteroidetes ratio, and a dysbiosis flag for a single "
                 "sample. Also returns cohort reference ranges for comparison."
             ),
-            parameters=Schema(
-                type=T.OBJECT,
-                properties={"sample_id": Schema(type=T.STRING, description="Sample ID to analyze.")},
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={"sample_id": types.Schema(type=types.Type.STRING, description="Sample ID to analyze.")},
                 required=["sample_id"],
             ),
         ),
-        FD(
+        types.FunctionDeclaration(
             name="get_top_taxa",
             description="Return the top N most abundant taxa for a sample with relative abundance and taxonomy.",
-            parameters=Schema(
-                type=T.OBJECT,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
                 properties={
-                    "sample_id": Schema(type=T.STRING),
-                    "n": Schema(type=T.INTEGER, description="Number of top taxa (1-50, default 10)."),
+                    "sample_id": types.Schema(type=types.Type.STRING),
+                    "n": types.Schema(type=types.Type.INTEGER, description="Number of top taxa (1-50, default 10)."),
                 },
                 required=["sample_id"],
             ),
         ),
-        FD(
+        types.FunctionDeclaration(
             name="search_pubmed",
             description="Search PubMed for up to 3 abstracts linking a bacterial genus to diet, nutrition, probiotics, or health outcomes.",
-            parameters=Schema(
-                type=T.OBJECT,
-                properties={"genus_name": Schema(type=T.STRING, description="Bacterial genus, e.g. 'Bifidobacterium'.")},
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={"genus_name": types.Schema(type=types.Type.STRING, description="Bacterial genus, e.g. 'Bifidobacterium'.")},
                 required=["genus_name"],
             ),
         ),
-        FD(
+        types.FunctionDeclaration(
             name="generate_report",
             description=(
                 "Compile a structured evidence payload (diversity, top taxa, "
                 "flagged-high taxa, metadata) for a sample. Call this when you "
                 "are ready to write the final report."
             ),
-            parameters=Schema(
-                type=T.OBJECT,
-                properties={"sample_id": Schema(type=T.STRING)},
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={"sample_id": types.Schema(type=types.Type.STRING)},
                 required=["sample_id"],
             ),
         ),
@@ -274,22 +269,24 @@ def run_agent(sample_id: str, model: str = DEFAULT_MODEL, verbose: bool = True) 
             "(get one free at https://aistudio.google.com/app/apikey)."
         )
 
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
 
-    genai.configure(api_key=api_key)
+    client = genai.Client(api_key=api_key)
 
-    gemini_model = genai.GenerativeModel(
-        model_name=model,
-        tools=_build_tools(),
+    config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
+        tools=_build_tools(),
     )
-
-    chat = gemini_model.start_chat(enable_automatic_function_calling=False)
 
     user_msg = (
         f"Please analyze sample_id='{sample_id}' from the American Gut Project "
         f"dataset and produce the final microbiome health report."
     )
+
+    contents: list[types.Content] = [
+        types.Content(role="user", parts=[types.Part.from_text(text=user_msg)])
+    ]
 
     transcript: list[dict[str, Any]] = []
     final_text: str | None = None
@@ -297,14 +294,20 @@ def run_agent(sample_id: str, model: str = DEFAULT_MODEL, verbose: bool = True) 
     if verbose:
         print(f"\n{'=' * 70}\n[agent] starting on {sample_id} (model={model})\n{'=' * 70}")
 
-    response = chat.send_message(user_msg)
-
     for step in range(MAX_TOOL_ITERATIONS):
+        response = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config,
+        )
+
+        candidate = response.candidates[0]
+        contents.append(candidate.content)
+
         fn_calls = []
         text_parts = []
-
-        for part in response.parts:
-            if part.function_call.name:
+        for part in candidate.content.parts:
+            if part.function_call:
                 fn_calls.append(part.function_call)
             elif part.text:
                 text_parts.append(part.text)
@@ -320,8 +323,8 @@ def run_agent(sample_id: str, model: str = DEFAULT_MODEL, verbose: bool = True) 
                 print(f"\n[agent] finished after {step + 1} steps.")
             break
 
-        # Execute each requested tool and collect FunctionResponse parts.
-        response_parts = []
+        # Execute each tool and build function-response parts.
+        response_parts: list[types.Part] = []
         for fc in fn_calls:
             name = fc.name
             args = dict(fc.args)
@@ -344,15 +347,10 @@ def run_agent(sample_id: str, model: str = DEFAULT_MODEL, verbose: bool = True) 
                 print(f"[step {step}] tool_result[{name}]: {preview}...")
 
             response_parts.append(
-                genai.protos.Part(
-                    function_response=genai.protos.FunctionResponse(
-                        name=name,
-                        response={"result": result},
-                    )
-                )
+                types.Part.from_function_response(name=name, response={"result": result})
             )
 
-        response = chat.send_message(response_parts)
+        contents.append(types.Content(role="user", parts=response_parts))
     else:
         if verbose:
             print(f"[agent] stopped at iteration cap ({MAX_TOOL_ITERATIONS}).")
